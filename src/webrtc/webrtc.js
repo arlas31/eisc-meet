@@ -1,14 +1,27 @@
-import { socket } from "../sockets/socketManager";
+import { getSocket } from "../sockets/socketManager";
 
-let peerConnection;
+let peerConnection = null;
 const iceServers = {
   iceServers: [
     { urls: ["stun:stun.l.google.com:19302"] }
   ]
 };
 
+function ensurePeerConnection() {
+  if (!peerConnection) {
+    peerConnection = new RTCPeerConnection(iceServers);
+  }
+  return peerConnection;
+}
+
 export function initWebRTC(localRef, remoteRef) {
-  peerConnection = new RTCPeerConnection(iceServers);
+  const socket = getSocket();
+  if (!socket) {
+    console.warn("initWebRTC: no socket available. Call connectToRoom(...) first.");
+    return;
+  }
+
+  const pc = ensurePeerConnection();
 
   navigator.mediaDevices.getUserMedia({ video: true, audio: true })
     .then(stream => {
@@ -17,56 +30,69 @@ export function initWebRTC(localRef, remoteRef) {
         localRef.current.srcObject = stream;
       }
 
+      // añadir tracks al peer connection (si hay duplicados, browser los ignora)
       stream.getTracks().forEach(track => {
-        peerConnection.addTrack(track, stream);
+        pc.addTrack(track, stream);
       });
+    })
+    .catch(err => {
+      console.error("Error getUserMedia:", err);
     });
 
-  peerConnection.ontrack = event => {
+  pc.ontrack = event => {
     if (remoteRef.current) {
       remoteRef.current.srcObject = event.streams[0];
     }
   };
 
-  peerConnection.onicecandidate = event => {
+  pc.onicecandidate = event => {
     if (event.candidate) {
-      socket.emit("webrtc:candidate", event.candidate);
+      socket.emit("webrtc:candidate", { candidate: event.candidate, room: socket.auth?.room });
     }
   };
 
-  socket.on("webrtc:offer", async offer => {
-    await peerConnection.setRemoteDescription(offer);
-    const answer = await peerConnection.createAnswer();
-    await peerConnection.setLocalDescription(answer);
-
-    socket.emit("webrtc:answer", answer);
-  });
-
-  socket.on("webrtc:answer", async answer => {
-    await peerConnection.setRemoteDescription(answer);
-  });
-
-  socket.on("webrtc:candidate", async candidate => {
+  socket.on("webrtc:offer", async ({ from, offer }) => {
     try {
-      await peerConnection.addIceCandidate(candidate);
+      await pc.setRemoteDescription(offer);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit("webrtc:answer", { answer, room: socket.auth?.room });
+    } catch (err) {
+      console.error("Error handling offer:", err);
+    }
+  });
+
+  socket.on("webrtc:answer", async ({ from, answer }) => {
+    try {
+      await pc.setRemoteDescription(answer);
+    } catch (err) {
+      console.error("Error setting remote answer:", err);
+    }
+  });
+
+  socket.on("webrtc:candidate", async ({ from, candidate }) => {
+    try {
+      await pc.addIceCandidate(candidate);
     } catch (error) {
       console.error("Error adding ICE candidate", error);
     }
   });
 
-  socket.emit("webrtc:join");
-
-  socket.on("webrtc:ready", async () => {
-    const offer = await peerConnection.createOffer();
-    await peerConnection.setLocalDescription(offer);
-
-    socket.emit("webrtc:offer", offer);
+  // Si otro peer indica que se mutearon
+  socket.on("user:muted", ({ userId, muted }) => {
+    console.log("user:muted", userId, muted);
+    // UI manejada en el componente Interaction, solo log aquí si quieres
   });
+
+  // avisar al servidor que estoy listo para negociar
+  socket.emit("webrtc:join", { room: socket.auth?.room, token: socket.auth?.token, username: socket.auth?.username });
 }
 
 let cameraStream = null;
 
 export async function shareScreen(localRef) {
+  const pc = ensurePeerConnection();
+
   if (!cameraStream && localRef.current?.srcObject instanceof MediaStream) {
     cameraStream = localRef.current.srcObject;
   }
@@ -81,8 +107,9 @@ export async function shareScreen(localRef) {
   }
 
   const screenTrack = screenStream.getVideoTracks()[0];
-  const sender = peerConnection.getSenders().find(s => s.track.kind === "video");
+  const sender = pc.getSenders().find(s => s.track && s.track.kind === "video");
   if (sender) sender.replaceTrack(screenTrack);
+  else pc.addTrack(screenTrack, screenStream);
 
   screenTrack.onended = () => {
     stopScreenShare(localRef);
@@ -97,6 +124,6 @@ export async function stopScreenShare(localRef) {
   }
 
   const cameraTrack = cameraStream.getVideoTracks()[0];
-  const sender = peerConnection.getSenders().find(s => s.track.kind === "video");
+  const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === "video");
   if (sender) sender.replaceTrack(cameraTrack);
 }
