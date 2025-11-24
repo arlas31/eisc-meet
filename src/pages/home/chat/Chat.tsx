@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { socket } from "../../../sockets/socketManager";
+import { getSocket, initSocket } from "../../../sockets/socketManager";
 
 type ChatMessage = {
   userId: string;
@@ -15,18 +15,42 @@ const Chat: React.FC = () => {
   const [messageDraft, setMessageDraft] = useState("");
 
   useEffect(() => {
-    socket.emit("newUser", usernameRef.current);
+    // Obtener la instancia actual del socket (si no existe, initSocket la creará)
+    const s = getSocket() ?? initSocket();
+
+    // Si el socket ya está conectado, registrar usuario; si no, hacerlo al conectar
+    const registerUser = () => {
+      if (s && s.connected) {
+        s.emit("newUser", usernameRef.current);
+      }
+    };
+
+    if (s) {
+      if (s.connected) {
+        registerUser();
+      } else {
+        s.on("connect", registerUser);
+      }
+    }
+
+    return () => {
+      if (s) s.off("connect", registerUser);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
+    const s = getSocket();
+    if (!s) return;
+
     const handleIncomingMessage = (payload: ChatMessage) => {
       setMessages(prev => [...prev, payload]);
     };
 
-    socket.on("chat:message", handleIncomingMessage);
+    s.on("chat:message", handleIncomingMessage);
 
     return () => {
-      socket.off("chat:message", handleIncomingMessage);
+      s.off("chat:message", handleIncomingMessage);
     };
   }, []);
 
@@ -38,10 +62,16 @@ const Chat: React.FC = () => {
       return;
     }
 
-    socket.emit("chat:message", {
-      userId: usernameRef.current,
-      message: trimmedMessage
-    });
+    const s = getSocket();
+    if (s && s.connected) {
+      s.emit("chat:message", {
+        userId: usernameRef.current,
+        message: trimmedMessage,
+        room: s.auth?.room // opcional: mandar room si el servidor lo espera
+      });
+    } else {
+      console.warn("Socket no conectado, mensaje no enviado");
+    }
 
     setMessageDraft("");
   };

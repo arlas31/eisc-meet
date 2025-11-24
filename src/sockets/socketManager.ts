@@ -27,20 +27,24 @@ export function initSocket() {
 
 /**
  * Conecta al socket y se une a una sala.
- * @param room nombre de sala
- * @param username identificador del usuario
- * @param token token opcional si el servidor lo requiere
+ * Emite webrtc:join SOLO al establecer la conexión para evitar joins repetidos.
  */
 export function connectToRoom(room: string, username?: string, token?: string) {
   const s = initSocket();
   if (!s) return null;
 
-  // auth opcional (solo metadata local, server debe validar en webrtc:join)
+  // auth opcional (solo metadata local)
   s.auth = { token, username, room };
 
-  // Conectar y emitir join payload que usa el server
+  // Conectar
   s.connect();
-  s.emit("webrtc:join", { room, token, username });
+
+  // Emitir webrtc:join solamente una vez al conectar
+  const handleConnect = () => {
+    s.emit("webrtc:join", { room, token, username });
+    s.off("connect", handleConnect);
+  };
+  s.on("connect", handleConnect);
 
   return s;
 }
