@@ -1,7 +1,11 @@
+/* contents of file */
 import { getSocket } from "../sockets/socketManager";
 
 let peerConnection = null;
 let makingOffer = false;
+let localStream = null;
+let pendingOfferRequested = false;
+
 const iceServers = {
   iceServers: [
     { urls: ["stun:stun.l.google.com:19302"] }
@@ -14,7 +18,6 @@ function ensurePeerConnection() {
 
     peerConnection.ontrack = (event) => {
       console.log("[webrtc] ontrack, streams:", event.streams);
-      // El código que usa initWebRTC se encargará de asignar remoteRef.srcObject
     };
 
     peerConnection.onicecandidate = (event) => {
@@ -25,17 +28,17 @@ function ensurePeerConnection() {
       }
     };
 
-    // Opcional: onnegotiationneeded fallback (iniciador)
     peerConnection.onnegotiationneeded = async () => {
       const socket = getSocket();
       if (!socket) return;
+      if (makingOffer) return;
       try {
         makingOffer = true;
-        console.log("[webrtc] onnegotiationneeded -> creando oferta");
+        console.log("[webrtc] onnegotiationneeded -> creando oferta (fallback)");
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
         socket.emit("webrtc:offer", { offer: peerConnection.localDescription, room: socket.auth?.room });
-        console.log("[webrtc] Oferta enviada por onnegotiationneeded");
+        console.log("[webrtc] Oferta enviada por onnegotiationneeded (fallback)");
       } catch (err) {
         console.error("[webrtc] Error en onnegotiationneeded", err);
       } finally {
@@ -46,7 +49,11 @@ function ensurePeerConnection() {
   return peerConnection;
 }
 
-export async function initWebRTC(localRef, remoteRef) {
+/**
+ * initWebRTC(localRef, remoteRef, options?)
+ * options: { onRemotePlayBlocked?: () => void, onRemotePlayStarted?: () => void }
+ */
+export async function initWebRTC(localRef, remoteRef, options = {}) {
   const socket = getSocket();
   if (!socket) {
     console.warn("initWebRTC: no socket available. Call connectToRoom(...) first.");
@@ -55,29 +62,11 @@ export async function initWebRTC(localRef, remoteRef) {
 
   const pc = ensurePeerConnection();
 
-  // Obtener y publicar la cámara/voz local
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    console.log("[webrtc] getUserMedia OK, tracks:", stream.getTracks());
-    // Mostrar preview local
-    if (localRef?.current) {
-      localRef.current.srcObject = stream;
-    }
-    // Añadir tracks al PeerConnection (si ya existen serán ignorados por el browser)
-    stream.getTracks().forEach(track => {
-      pc.addTrack(track, stream);
-    });
-  } catch (err) {
-    console.error("[webrtc] Error getUserMedia:", err);
-    return;
-  }
-
-  // Cuando llegue un offer desde el servidor
+  // Handlers de señalización (offer/answer/candidate/ready)
   socket.off("webrtc:offer");
   socket.on("webrtc:offer", async ({ from, offer }) => {
     try {
       console.log("[webrtc] Oferta recibida desde", from);
-      // Si estamos en proceso de hacer una oferta, podemos esperar o aplicar simple polite logic.
       await pc.setRemoteDescription(offer);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
@@ -109,39 +98,117 @@ export async function initWebRTC(localRef, remoteRef) {
     }
   });
 
-  // Cuando el servidor indique que otro peer está listo -> crear oferta
   socket.off("webrtc:ready");
   socket.on("webrtc:ready", async ({ from, username }) => {
     try {
-      console.log("[webrtc] webrtc:ready recibido de", from, "=> vamos a crear oferta");
-      // Asegurar que la pc existe y que tenemos tracks añadidos antes de crear la oferta
+      console.log("[webrtc] webrtc:ready recibido de", from);
+      if (!localStream) {
+        console.log("[webrtc] aún no hay localStream -> marcar pendingOfferRequested");
+        pendingOfferRequested = true;
+        return;
+      }
+      if (makingOffer) {
+        console.log("[webrtc] ya se está creando una oferta, ignorando ready");
+        return;
+      }
+      makingOffer = true;
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       socket.emit("webrtc:offer", { offer: pc.localDescription, room: socket.auth?.room });
-      console.log("[webrtc] Oferta creada y enviada a la sala");
+      console.log("[webrtc] Oferta creada y enviada en respuesta a ready");
     } catch (err) {
       console.error("[webrtc] Error creando oferta en ready:", err);
+    } finally {
+      makingOffer = false;
+      pendingOfferRequested = false;
     }
   });
 
-  // Actualizar el elemento <video> remoto cuando llegue track
+  // getUserMedia y añadir tracks
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    console.log("[webrtc] getUserMedia OK, tracks:", stream.getTracks());
+    localStream = stream;
+
+    if (localRef?.current) {
+      localRef.current.srcObject = stream;
+      localRef.current.muted = true;
+      localRef.current.play().catch(err => console.warn("[webrtc] local play() falló:", err));
+    }
+
+    stream.getTracks().forEach(track => {
+      pc.addTrack(track, stream);
+    });
+
+    if (pendingOfferRequested) {
+      const socket2 = getSocket();
+      if (!socket2) return;
+      if (makingOffer) return;
+      try {
+        makingOffer = true;
+        console.log("[webrtc] pendingOfferRequested -> crear oferta ahora");
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket2.emit("webrtc:offer", { offer: pc.localDescription, room: socket2.auth?.room });
+        console.log("[webrtc] Oferta enviada (pending)");
+      } catch (err) {
+        console.error("[webrtc] Error creando oferta por pendingOfferRequested", err);
+      } finally {
+        makingOffer = false;
+        pendingOfferRequested = false;
+      }
+    }
+  } catch (err) {
+    console.error("[webrtc] Error getUserMedia:", err);
+    return;
+  }
+
+  // Dedup stream id
+  let lastRemoteStreamId = null;
+
   pc.ontrack = (event) => {
     console.log("[webrtc] ontrack event:", event.streams);
-    if (remoteRef?.current) {
-      remoteRef.current.srcObject = event.streams[0];
+    const stream = event.streams && event.streams[0];
+    if (!stream) return;
+    try {
+      if (!remoteRef?.current) {
+        console.warn("[webrtc] ontrack: remoteRef no está definido");
+        return;
+      }
+
+      if (stream.id === lastRemoteStreamId) {
+        console.log("[webrtc] ontrack: misma stream ya asignada, ignorando reasignación (streamId)", stream.id);
+        return;
+      }
+
+      lastRemoteStreamId = stream.id;
+      remoteRef.current.srcObject = stream;
+
+      // Para permitir autoplay, lo dejamos inicialmente silenciado (muted = true)
+      // El usuario podrá activar audio posteriormente desde la UI.
+      remoteRef.current.muted = true;
+      remoteRef.current.play()
+        .then(() => {
+          console.log("[webrtc] remote video reproducción iniciada correctamente (play())");
+          if (options.onRemotePlayStarted) options.onRemotePlayStarted();
+        })
+        .catch(err => {
+          console.warn("[webrtc] remote play() falló (autoplay bloqueado). Debe hacer click para permitir audio/video:", err);
+          if (options.onRemotePlayBlocked) options.onRemotePlayBlocked();
+        });
+
+      console.log("[webrtc] remote stream asignada id:", stream.id, "tracks:", stream.getTracks());
+    } catch (e) {
+      console.error("[webrtc] Error en ontrack handler:", e);
     }
   };
-
-  // NOTA: no emitimos webrtc:join aquí; connectToRoom se encargó de emitir al conectar.
 }
-
-let cameraStream = null;
 
 export async function shareScreen(localRef) {
   const pc = ensurePeerConnection();
 
-  if (!cameraStream && localRef.current?.srcObject instanceof MediaStream) {
-    cameraStream = localRef.current.srcObject;
+  if (!localStream && localRef.current?.srcObject instanceof MediaStream) {
+    localStream = localRef.current.srcObject;
   }
 
   try {
@@ -173,13 +240,13 @@ export async function shareScreen(localRef) {
 }
 
 export async function stopScreenShare(localRef) {
-  if (!cameraStream) return;
+  if (!localStream) return;
 
   if (localRef.current) {
-    localRef.current.srcObject = cameraStream;
+    localRef.current.srcObject = localStream;
   }
 
-  const cameraTrack = cameraStream.getVideoTracks()[0];
+  const cameraTrack = localStream.getVideoTracks()[0];
   const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === "video");
   if (sender) {
     await sender.replaceTrack(cameraTrack);

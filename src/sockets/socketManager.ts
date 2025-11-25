@@ -4,43 +4,49 @@ let socket: Socket | null = null;
 
 export function initSocket() {
   if (socket) return socket;
+
   const url = String(import.meta.env.VITE_SOCKET_URL ?? "http://localhost:9000");
+  console.log("[socketManager] initSocket - url:", url);
+
+  // No forzamos solo 'websocket' — permitimos polling como fallback
   socket = io(url, {
     autoConnect: false,
-    transports: ["websocket"]
+    // transports: ["polling", "websocket"], // polling first then upgrade
+    // Opciones de reconexión útiles para dev
+    reconnection: true,
+    reconnectionAttempts: 10,
+    reconnectionDelay: 500,
+    reconnectionDelayMax: 2000
   });
 
   socket.on("connect_error", (err) => {
-    console.error("Socket connect_error:", err);
+    console.error("[socketManager] Socket connect_error:", err);
   });
 
   socket.on("connect", () => {
-    console.log("Socket conectado:", socket?.id);
+    console.log("[socketManager] Socket conectado:", socket?.id);
   });
 
   socket.on("disconnect", (reason) => {
-    console.log("Socket desconectado:", reason);
+    console.log("[socketManager] Socket desconectado:", reason);
   });
 
   return socket;
 }
 
-/**
- * Conecta al socket y se une a una sala.
- * Emite webrtc:join SOLO al establecer la conexión para evitar joins repetidos.
- */
 export function connectToRoom(room: string, username?: string, token?: string) {
+  const socketUrl = String(import.meta.env.VITE_SOCKET_URL ?? "http://localhost:9000");
+  console.log("[socketManager] connectToRoom: connecting to", socketUrl, "room:", room);
+
   const s = initSocket();
   if (!s) return null;
 
-  // auth opcional (solo metadata local)
   s.auth = { token, username, room };
 
-  // Conectar
   s.connect();
 
-  // Emitir webrtc:join solamente una vez al conectar
   const handleConnect = () => {
+    console.log("[socketManager] conectado, emitiendo webrtc:join ->", { room, username });
     s.emit("webrtc:join", { room, token, username });
     s.off("connect", handleConnect);
   };
